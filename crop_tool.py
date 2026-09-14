@@ -284,6 +284,17 @@ class MainWindow(QMainWindow):
         form.addRow("Максимум:", self.max_size)
         panel.addWidget(settings)
 
+        rotate = QHBoxLayout()
+        self.rotate_left_button = QPushButton("↶ 90° влево")
+        self.rotate_right_button = QPushButton("90° вправо ↷")
+        self.rotate_left_button.setToolTip("Повернуть против часовой стрелки (Ctrl+←)")
+        self.rotate_right_button.setToolTip("Повернуть по часовой стрелке (Ctrl+→)")
+        self.rotate_left_button.clicked.connect(self.rotate_left)
+        self.rotate_right_button.clicked.connect(self.rotate_right)
+        rotate.addWidget(self.rotate_left_button)
+        rotate.addWidget(self.rotate_right_button)
+        panel.addLayout(rotate)
+
         self.counter = QLabel("Фото 0 из 0")
         self.counter.setAlignment(Qt.AlignmentFlag.AlignCenter)
         panel.addWidget(self.counter)
@@ -299,14 +310,25 @@ class MainWindow(QMainWindow):
         self.crop_button.setMinimumHeight(48)
         self.crop_button.clicked.connect(self.crop_and_next)
         panel.addWidget(self.crop_button)
-        hints = QLabel("Enter / Пробел — сохранить и дальше\n← / → — назад / пропустить\n1–4 — выбрать формат рамки")
+        hints = QLabel(
+            "Enter / Пробел — сохранить и дальше\n"
+            "← / → — назад / пропустить\n"
+            "Ctrl+← / Ctrl+→ — повернуть на 90°\n"
+            "1–4 — выбрать формат рамки"
+        )
         hints.setStyleSheet("color: #777")
         panel.addWidget(hints)
         panel.addStretch()
 
     def _add_shortcuts(self) -> None:
-        bindings = (("Return", self.crop_and_next), ("Space", self.crop_and_next),
-                    ("Left", self.previous_image), ("Right", self.next_image))
+        bindings = (
+            ("Return", self.crop_and_next),
+            ("Space", self.crop_and_next),
+            ("Left", self.previous_image),
+            ("Right", self.next_image),
+            ("Ctrl+Left", self.rotate_left),
+            ("Ctrl+Right", self.rotate_right),
+        )
         for key, handler in bindings:
             action = QAction(self)
             action.setShortcut(QKeySequence(key))
@@ -384,6 +406,21 @@ class MainWindow(QMainWindow):
             self.index += 1
             self.load_current()
 
+    def rotate_left(self) -> None:
+        """Rotate the working image 90 degrees counter-clockwise."""
+        self._rotate(Image.Transpose.ROTATE_90)
+
+    def rotate_right(self) -> None:
+        """Rotate the working image 90 degrees clockwise."""
+        self._rotate(Image.Transpose.ROTATE_270)
+
+    def _rotate(self, operation: Image.Transpose) -> None:
+        if self.current_image is None:
+            return
+        self.current_image = self.current_image.transpose(operation)
+        # The maximum centered crop is easier to position after orientation changes.
+        self.view.set_pil_image(self.current_image)
+
     def crop_and_next(self) -> None:
         if self.current_image is None or self.output_dir is None or self.view.crop_rect.isEmpty():
             return
@@ -449,6 +486,8 @@ class MainWindow(QMainWindow):
         self.crop_button.setEnabled(active)
         self.skip_button.setEnabled(active)
         self.back_button.setEnabled(active and self.index > 0)
+        self.rotate_left_button.setEnabled(active)
+        self.rotate_right_button.setEnabled(active)
 
 
 def main() -> int:
