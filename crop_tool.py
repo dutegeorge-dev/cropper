@@ -6,6 +6,7 @@ import sys
 from pathlib import Path
 
 from PIL import Image, ImageOps
+from pillow_heif import register_heif_opener
 from PySide6.QtCore import QPointF, QRectF, Qt, Signal
 from PySide6.QtGui import QAction, QColor, QImage, QKeySequence, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
@@ -31,7 +32,11 @@ from PySide6.QtWidgets import (
 )
 
 
-SUPPORTED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
+# Register HEIF/HEIC with Pillow before the first Image.open() call.  pillow-heif
+# also bundles the native decoder when the application is built by PyInstaller.
+register_heif_opener()
+
+SUPPORTED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".heic", ".heif"}
 RATIOS = (("16:10", 16 / 10), ("16:9", 16 / 9), ("4:3", 4 / 3), ("1:1", 1.0))
 
 
@@ -327,7 +332,11 @@ class MainWindow(QMainWindow):
             self.index = -1
             self.current_image = None
             self.view.clear_image()
-            QMessageBox.information(self, "Нет фотографий", "В выбранной папке нет JPG, PNG или WebP файлов.")
+            QMessageBox.information(
+                self,
+                "Нет фотографий",
+                "В выбранной папке нет JPG, PNG, WebP, HEIC или HEIF файлов.",
+            )
         else:
             self.output_dir = self.source_dir / "cropped"
             self.output_label.setText(f"Назначение: {self.output_dir}")

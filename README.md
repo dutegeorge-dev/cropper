@@ -6,14 +6,21 @@
 
 ## Запуск из исходников
 
-Нужен Python 3.10 или новее. В PowerShell или `cmd` из папки проекта выполните:
+Нужен Python 3.10 или новее. В **PowerShell** из папки проекта выполните команды
+ниже. Активировать окружение не требуется: явный путь к `python.exe` работает
+даже там, где политика PowerShell запрещает запуск `Activate.ps1`.
 
 ```powershell
 py -m venv .venv
-.venv\Scripts\activate
-pip install pyside6 pillow pyinstaller
-python crop_tool.py
+.\.venv\Scripts\python.exe -m pip install --upgrade pip
+.\.venv\Scripts\python.exe -m pip install pyside6 pillow pillow-heif pyinstaller
+.\.venv\Scripts\python.exe crop_tool.py
 ```
+
+Если команда `py` отсутствует, установите Python с
+[python.org](https://www.python.org/downloads/windows/), отметив в установщике
+**Add python.exe to PATH**, а затем откройте новое окно PowerShell. Вызов
+`python -m pip` через полный путь гарантирует установку пакетов именно в `.venv`.
 
 Нажмите **«Открыть папку…»**. По умолчанию результат попадёт в подпапку
 `cropped`; при необходимости выберите другую папку назначения.
@@ -33,33 +40,44 @@ python crop_tool.py
 ## Сборка одного `.exe` для Windows
 
 Собирать Windows-приложение нужно **на Windows** (PyInstaller не является
-кросс-компилятором). После установки зависимостей достаточно команды:
+кросс-компилятором). После установки зависимостей достаточно команды; окружение
+активировать не нужно:
 
 ```powershell
-pyinstaller --noconfirm --clean --onefile --windowed --name PhotoCropper --collect-all PySide6 --collect-all PIL crop_tool.py
+.\.venv\Scripts\python.exe -m PyInstaller --noconfirm --clean --onefile --windowed --name PhotoCropper --collect-all PySide6 --collect-all PIL --collect-all pillow_heif crop_tool.py
 ```
 
 Готовый файл находится в `dist\PhotoCropper.exe`. Флаг `--windowed` убирает
 консоль, `--onefile` упаковывает приложение в один файл, а `--collect-all`
-явно включает плагины Qt (в частности, платформенный плагин Windows) и модули
-Pillow. Первый запуск onefile-сборки может быть чуть медленнее: файлы временно
-распаковываются системой.
+явно включает плагины Qt (в частности, платформенный плагин Windows), модули
+Pillow и нативный HEIF/HEIC-декодер из `pillow-heif`. Первый запуск
+onefile-сборки может быть чуть медленнее: файлы временно распаковываются системой.
 
 Если установлен старый PyInstaller или возникает ошибка о Qt platform plugin,
 обновите инструменты и пересоберите проект с очисткой:
 
 ```powershell
-pip install --upgrade pyside6 pillow pyinstaller
-pyinstaller --noconfirm --clean --onefile --windowed --name PhotoCropper --collect-all PySide6 --collect-all PIL crop_tool.py
+.\.venv\Scripts\python.exe -m pip install --upgrade pyside6 pillow pillow-heif pyinstaller
+.\.venv\Scripts\python.exe -m PyInstaller --noconfirm --clean --onefile --windowed --name PhotoCropper --collect-all PySide6 --collect-all PIL --collect-all pillow_heif crop_tool.py
 ```
 
 Не используйте одновременно PyQt и PySide в том же виртуальном окружении:
 PyInstaller может обнаружить обе Qt-привязки и остановить сборку. Самый простой
 способ избежать конфликта — чистое окружение `.venv`, созданное командами выше.
 
+Если активация всё же нужна, её можно разрешить только для текущего окна
+PowerShell, не меняя системные настройки:
+
+```powershell
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+.\.venv\Scripts\Activate.ps1
+```
+
 ## Ошибки и форматы
 
-Поддерживаются `.jpg`, `.jpeg`, `.png` и `.webp`. Битые файлы показываются в
-предупреждении и пропускаются. При невозможности создать папку или записать файл
-приложение показывает ошибку и остаётся на текущей фотографии, поэтому рамку не
-нужно выставлять заново.
+Поддерживаются `.jpg`, `.jpeg`, `.png`, `.webp`, `.heic` и `.heif`. Файлы HEIC
+открываются через `pillow-heif`; результат, как и для остальных исходников,
+сохраняется в выбранный JPG или PNG. Битые файлы показываются в предупреждении и
+пропускаются. При невозможности создать папку или записать файл приложение
+показывает ошибку и остаётся на текущей фотографии, поэтому рамку не нужно
+выставлять заново.
