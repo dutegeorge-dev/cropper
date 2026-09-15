@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+import math
 import sys
 from pathlib import Path
 
 from PIL import Image, ImageOps
 from pillow_heif import register_heif_opener
-from PySide6.QtCore import QPointF, QRectF, Qt, Signal
-from PySide6.QtGui import QAction, QColor, QImage, QKeySequence, QPainter, QPen, QPixmap
+from PySide6.QtCore import QPointF, QRectF, QSize, Qt, Signal
+from PySide6.QtGui import QAction, QColor, QIcon, QImage, QKeySequence, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QButtonGroup,
@@ -25,8 +26,10 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QRadioButton,
+    QScrollArea,
     QSlider,
     QSpinBox,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -38,6 +41,16 @@ register_heif_opener()
 
 SUPPORTED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".heic", ".heif"}
 RATIOS = (("16:10", 16 / 10), ("16:9", 16 / 9), ("4:3", 4 / 3), ("1:1", 1.0))
+
+
+def pil_to_pixmap(image: Image.Image) -> QPixmap:
+    """Create an owning Qt pixmap from a Pillow image."""
+    rgba = image.convert("RGBA")
+    data = rgba.tobytes("raw", "RGBA")
+    qimage = QImage(
+        data, rgba.width, rgba.height, rgba.width * 4, QImage.Format.Format_RGBA8888
+    ).copy()
+    return QPixmap.fromImage(qimage)
 
 
 class CropView(QGraphicsView):
@@ -62,10 +75,7 @@ class CropView(QGraphicsView):
         self._start_rect = QRectF()
 
     def set_pil_image(self, image: Image.Image) -> None:
-        rgba = image.convert("RGBA")
-        data = rgba.tobytes("raw", "RGBA")
-        qimage = QImage(data, rgba.width, rgba.height, rgba.width * 4, QImage.Format.Format_RGBA8888).copy()
-        pixmap = QPixmap.fromImage(qimage)
+        pixmap = pil_to_pixmap(image)
         self.scene().clear()
         self._pixmap_item = self.scene().addPixmap(pixmap)
         self.image_rect = QRectF(0, 0, image.width, image.height)
@@ -218,6 +228,8 @@ class MainWindow(QMainWindow):
         self.source_dir: Path | None = None
         self.output_dir: Path | None = None
         self.current_image: Image.Image | None = None
+        self.collage_files: set[Path] = set()
+        self.rotations: dict[Path, int] = {}
         self._build_ui()
         self._add_shortcuts()
         self._update_controls()
@@ -226,8 +238,21 @@ class MainWindow(QMainWindow):
         root = QWidget()
         self.setCentralWidget(root)
         layout = QHBoxLayout(root)
+        media = QVBoxLayout()
         self.view = CropView()
-        layout.addWidget(self.view, 1)
+        media.addWidget(self.view, 1)
+        self.carousel = QScrollArea()
+        self.carousel.setWidgetResizable(True)
+        self.carousel.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.carousel.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.carousel.setFixedHeight(112)
+        self.carousel_content = QWidget()
+        self.carousel_layout = QHBoxLayout(self.carousel_content)
+        self.carousel_layout.setContentsMargins(4, 4, 4, 4)
+        self.carousel_layout.setSpacing(6)
+        self.carousel.setWidget(self.carousel_content)
+        media.addWidget(self.carousel)
+        layout.addLayout(media, 1)
 
         panel = QVBoxLayout()
         panel.setSpacing(12)
@@ -295,6 +320,23 @@ class MainWindow(QMainWindow):
         rotate.addWidget(self.rotate_right_button)
         panel.addLayout(rotate)
 
+        collage_box = QGroupBox("Коллаж")
+        collage_layout = QVBoxLayout(collage_box)
+        self.collage_count = QLabel("Выбрано фото: 0")
+        self.collage_toggle_button = QPushButton("Добавить текущее фото")
+        self.collage_create_button = QPushButton("Создать коллаж")
+        self.collage_clear_button = QPushButton("Очистить выбор")
+        self.collage_toggle_button.clicked.connect(self.toggle_collage_photo)
+        self.collage_create_button.clicked.connect(self.create_collage)
+        self.collage_clear_button.clicked.connect(self.clear_collage)
+        collage_layout.addWidget(self.collage_count)
+        collage_layout.addWidget(self.collage_toggle_button)
+        collage_actions = QHBoxLayout()
+        collage_actions.addWidget(self.collage_create_button)
+        collage_actions.addWidget(self.collage_clear_button)
+        collage_layout.addLayout(collage_actions)
+        panel.addWidget(collage_box)
+
         self.counter = QLabel("Фото 0 из 0")
         self.counter.setAlignment(Qt.AlignmentFlag.AlignCenter)
         panel.addWidget(self.counter)
@@ -314,7 +356,8 @@ class MainWindow(QMainWindow):
             "Enter / Пробел — сохранить и дальше\n"
             "← / → — назад / пропустить\n"
             "Ctrl+← / Ctrl+→ — повернуть на 90°\n"
-            "1–4 — выбрать формат рамки"
+            "1–4 — выбрать формат рамки\n"
+            "Клик по миниатюре — открыть фото"
         )
         hints.setStyleSheet("color: #777")
         panel.addWidget(hints)
@@ -346,6 +389,8 @@ class MainWindow(QMainWindow):
         if not selected:
             return
         self.source_dir = Path(selected)
+        self.collage_files.clear()
+        self.rotations.clear()
         self.files = sorted(
             (path for path in self.source_dir.iterdir() if path.is_file() and path.suffix.lower() in SUPPORTED_EXTENSIONS),
             key=lambda path: path.name.casefold(),
@@ -380,9 +425,11 @@ class MainWindow(QMainWindow):
                 with Image.open(path) as opened:
                     opened.load()
                     self.current_image = ImageOps.exif_transpose(opened).copy()
+                self._apply_saved_rotation(path)
                 self.view.set_pil_image(self.current_image)
                 self.setWindowTitle(f"Быстрая обрезка фото — {path.name}")
                 self._update_controls()
+                self._rebuild_carousel()
                 return
             except Exception as error:
                 QMessageBox.warning(self, "Не удалось открыть", f"{path.name}\n\n{error}\n\nФайл будет пропущен.")
@@ -390,6 +437,7 @@ class MainWindow(QMainWindow):
         self.current_image = None
         self.view.clear_image()
         self._update_controls()
+        self._rebuild_carousel()
         if self.files and self.index >= len(self.files):
             QMessageBox.information(self, "Готово", "Все фотографии обработаны или пропущены.")
 
@@ -408,18 +456,166 @@ class MainWindow(QMainWindow):
 
     def rotate_left(self) -> None:
         """Rotate the working image 90 degrees counter-clockwise."""
-        self._rotate(Image.Transpose.ROTATE_90)
+        self._rotate(Image.Transpose.ROTATE_90, -1)
 
     def rotate_right(self) -> None:
         """Rotate the working image 90 degrees clockwise."""
-        self._rotate(Image.Transpose.ROTATE_270)
+        self._rotate(Image.Transpose.ROTATE_270, 1)
 
-    def _rotate(self, operation: Image.Transpose) -> None:
+    def _rotate(self, operation: Image.Transpose, quarter_turns: int) -> None:
         if self.current_image is None:
             return
         self.current_image = self.current_image.transpose(operation)
+        path = self.files[self.index]
+        self.rotations[path] = (self.rotations.get(path, 0) + quarter_turns) % 4
         # The maximum centered crop is easier to position after orientation changes.
         self.view.set_pil_image(self.current_image)
+        self._rebuild_carousel()
+
+    def _apply_saved_rotation(self, path: Path) -> None:
+        turns = self.rotations.get(path, 0)
+        if turns:
+            operation = (
+                Image.Transpose.ROTATE_270,
+                Image.Transpose.ROTATE_180,
+                Image.Transpose.ROTATE_90,
+            )[turns - 1]
+            self.current_image = self.current_image.transpose(operation)
+
+    def _open_carousel_image(self, target_index: int) -> None:
+        self.index = target_index
+        self.load_current()
+
+    def _rebuild_carousel(self) -> None:
+        while item := self.carousel_layout.takeAt(0):
+            if item.widget():
+                item.widget().deleteLater()
+        if not self.files or self.index < 0:
+            return
+        first = min(max(0, self.index - 4), max(0, len(self.files) - 9))
+        last = min(len(self.files), first + 9)
+        for target_index in range(first, last):
+            path = self.files[target_index]
+            button = QToolButton()
+            button.setFixedSize(118, 92)
+            button.setIconSize(QSize(106, 76))
+            button.setToolTip(f"{target_index + 1} из {len(self.files)} — {path.name}")
+            try:
+                with Image.open(path) as opened:
+                    thumb = ImageOps.exif_transpose(opened)
+                    turns = self.rotations.get(path, 0)
+                    if turns:
+                        operation = (
+                            Image.Transpose.ROTATE_270,
+                            Image.Transpose.ROTATE_180,
+                            Image.Transpose.ROTATE_90,
+                        )[turns - 1]
+                        thumb = thumb.transpose(operation)
+                    thumb.thumbnail((106, 76), Image.Resampling.LANCZOS)
+                    thumb = thumb.copy()
+                button.setIcon(QIcon(pil_to_pixmap(thumb)))
+            except Exception:
+                button.setText("Ошибка")
+            border = "#2196f3" if target_index == self.index else "transparent"
+            background = "#dff5df" if path in self.collage_files else "transparent"
+            button.setStyleSheet(
+                f"QToolButton {{ border: 3px solid {border}; background: {background}; }}"
+            )
+            button.clicked.connect(
+                lambda checked=False, value=target_index: self._open_carousel_image(value)
+            )
+            self.carousel_layout.addWidget(button)
+        self.carousel_layout.addStretch()
+
+    def toggle_collage_photo(self) -> None:
+        if self.current_image is None:
+            return
+        path = self.files[self.index]
+        if path in self.collage_files:
+            self.collage_files.remove(path)
+        else:
+            self.collage_files.add(path)
+        self._update_controls()
+        self._rebuild_carousel()
+
+    def clear_collage(self) -> None:
+        self.collage_files.clear()
+        self._update_controls()
+        self._rebuild_carousel()
+
+    def create_collage(self) -> None:
+        if len(self.collage_files) < 2 or self.output_dir is None:
+            QMessageBox.information(self, "Коллаж", "Выберите не менее двух фотографий.")
+            return
+        ordered_paths = [path for path in self.files if path in self.collage_files]
+        try:
+            images = [self._load_for_collage(path) for path in ordered_paths]
+            collage = self._compose_collage(images)
+            self.output_dir.mkdir(parents=True, exist_ok=True)
+            suffix = str(self.ratio_group.checkedButton().property("suffix"))
+            extension = ".jpg" if self.format_combo.currentText() == "JPG" else ".png"
+            output_path = self._unique_named_path(f"collage_{suffix}", extension)
+            if extension == ".jpg":
+                collage.save(
+                    output_path,
+                    "JPEG",
+                    quality=self.quality_slider.value(),
+                    subsampling=0,
+                )
+            else:
+                collage.save(output_path, "PNG", compress_level=6)
+        except Exception as error:
+            QMessageBox.critical(self, "Ошибка коллажа", f"Не удалось создать коллаж:\n{error}")
+            return
+        QMessageBox.information(self, "Коллаж сохранён", str(output_path))
+
+    def _load_for_collage(self, path: Path) -> Image.Image:
+        with Image.open(path) as opened:
+            opened.load()
+            image = ImageOps.exif_transpose(opened).convert("RGB")
+        turns = self.rotations.get(path, 0)
+        if turns:
+            operation = (
+                Image.Transpose.ROTATE_270,
+                Image.Transpose.ROTATE_180,
+                Image.Transpose.ROTATE_90,
+            )[turns - 1]
+            image = image.transpose(operation)
+        return image
+
+    def _compose_collage(self, images: list[Image.Image]) -> Image.Image:
+        """Place center-cropped photos in an automatic white grid."""
+        button = self.ratio_group.checkedButton()
+        ratio_width = int(button.property("ratioWidth"))
+        ratio_height = int(button.property("ratioHeight"))
+        target_long = self.max_size.value() if self.limit_checkbox.isChecked() else max(
+            max(image.size) for image in images
+        )
+        factor = max(1, target_long // ratio_width)
+        canvas_width = ratio_width * factor
+        canvas_height = ratio_height * factor
+        columns = min(len(images), max(1, math.ceil(math.sqrt(len(images) * ratio_width / ratio_height))))
+        rows = math.ceil(len(images) / columns)
+        gap = max(4, round(min(canvas_width, canvas_height) * 0.015))
+        cell_width = (canvas_width - gap * (columns + 1)) // columns
+        cell_height = (canvas_height - gap * (rows + 1)) // rows
+        if cell_width < 1 or cell_height < 1:
+            raise ValueError("Выбранный максимальный размер слишком мал для такого количества фото")
+        canvas = Image.new("RGB", (canvas_width, canvas_height), "white")
+        for position, image in enumerate(images):
+            row, column = divmod(position, columns)
+            scale = max(cell_width / image.width, cell_height / image.height)
+            resized = image.resize(
+                (max(1, round(image.width * scale)), max(1, round(image.height * scale))),
+                Image.Resampling.LANCZOS,
+            )
+            left = (resized.width - cell_width) // 2
+            top = (resized.height - cell_height) // 2
+            tile = resized.crop((left, top, left + cell_width, top + cell_height))
+            x = gap + column * (cell_width + gap)
+            y = gap + row * (cell_height + gap)
+            canvas.paste(tile, (x, y))
+        return canvas
 
     def crop_and_next(self) -> None:
         if self.current_image is None or self.output_dir is None or self.view.crop_rect.isEmpty():
@@ -471,6 +667,9 @@ class MainWindow(QMainWindow):
         suffix = str(self.ratio_group.checkedButton().property("suffix"))
         extension = ".jpg" if self.format_combo.currentText() == "JPG" else ".png"
         base = f"{self.files[self.index].stem}_{suffix}"
+        return self._unique_named_path(base, extension)
+
+    def _unique_named_path(self, base: str, extension: str) -> Path:
         candidate = self.output_dir / f"{base}{extension}"
         number = 2
         while candidate.exists():
@@ -488,6 +687,15 @@ class MainWindow(QMainWindow):
         self.back_button.setEnabled(active and self.index > 0)
         self.rotate_left_button.setEnabled(active)
         self.rotate_right_button.setEnabled(active)
+        selected = len(self.collage_files)
+        self.collage_count.setText(f"Выбрано фото: {selected}")
+        current_selected = active and self.files[self.index] in self.collage_files
+        self.collage_toggle_button.setText(
+            "Убрать текущее фото" if current_selected else "Добавить текущее фото"
+        )
+        self.collage_toggle_button.setEnabled(active)
+        self.collage_create_button.setEnabled(selected >= 2 and self.output_dir is not None)
+        self.collage_clear_button.setEnabled(selected > 0)
 
 
 def main() -> int:
