@@ -9,8 +9,8 @@ from pathlib import Path
 import av
 from PIL import Image, ImageOps
 from pillow_heif import register_heif_opener
-from PySide6.QtCore import QPointF, QRectF, QSize, Qt, Signal
-from PySide6.QtGui import QAction, QColor, QIcon, QImage, QKeySequence, QPainter, QPen, QPixmap
+from PySide6.QtCore import QPointF, QRectF, QSize, Qt, QTimer, Signal
+from PySide6.QtGui import QAction, QBrush, QColor, QIcon, QImage, QKeySequence, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QButtonGroup,
@@ -23,14 +23,15 @@ from PySide6.QtWidgets import (
     QGroupBox,
     QHBoxLayout,
     QLabel,
+    QListView,
+    QListWidget,
+    QListWidgetItem,
     QMainWindow,
     QMessageBox,
     QPushButton,
     QRadioButton,
-    QScrollArea,
     QSlider,
     QSpinBox,
-    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -43,6 +44,7 @@ register_heif_opener()
 SUPPORTED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".heic", ".heif"}
 SUPPORTED_VIDEO_EXTENSIONS = {".mov", ".mp4"}
 RATIOS = (("16:10", 16 / 10), ("16:9", 16 / 9), ("4:3", 4 / 3), ("1:1", 1.0))
+THUMBNAIL_LOADED_ROLE = 257  # Qt.UserRole + 1
 
 
 def pil_to_pixmap(image: Image.Image) -> QPixmap:
@@ -220,6 +222,38 @@ class CropView(QGraphicsView):
         super().mouseReleaseEvent(event)
 
 
+class SeekSlider(QSlider):
+    """Slider that seeks to the exact mouse position, not by a small page step."""
+
+    def _value_at(self, x: float) -> int:
+        usable_width = max(1, self.width() - 1)
+        fraction = min(1.0, max(0.0, x / usable_width))
+        return round(self.minimum() + fraction * (self.maximum() - self.minimum()))
+
+    def mousePressEvent(self, event) -> None:  # noqa: N802 (Qt API)
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.setSliderDown(True)
+            self.setValue(self._value_at(event.position().x()))
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event) -> None:  # noqa: N802 (Qt API)
+        if self.isSliderDown():
+            self.setValue(self._value_at(event.position().x()))
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:  # noqa: N802 (Qt API)
+        if event.button() == Qt.MouseButton.LeftButton and self.isSliderDown():
+            self.setValue(self._value_at(event.position().x()))
+            self.setSliderDown(False)
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -238,6 +272,7 @@ class MainWindow(QMainWindow):
         self.video_duration = 0.0
         self.video_fps = 30.0
         self.current_is_video = False
+        self._thumbnail_load_scheduled = False
         self._build_ui()
         self._add_shortcuts()
         self._update_controls()
@@ -246,20 +281,23 @@ class MainWindow(QMainWindow):
         root = QWidget()
         self.setCentralWidget(root)
         layout = QHBoxLayout(root)
+        self.browser = QListWidget()
+        self.browser.setViewMode(QListView.ViewMode.IconMode)
+        self.browser.setResizeMode(QListView.ResizeMode.Adjust)
+        self.browser.setMovement(QListView.Movement.Static)
+        self.browser.setIconSize(QSize(116, 82))
+        self.browser.setGridSize(QSize(138, 118))
+        self.browser.setWordWrap(True)
+        self.browser.setFixedWidth(302)
+        self.browser.setToolTip("Все фото и видео из выбранной папки")
+        self.browser.itemClicked.connect(self._open_browser_item)
+        self.browser.verticalScrollBar().valueChanged.connect(
+            lambda: self._schedule_visible_thumbnails()
+        )
+        layout.addWidget(self.browser)
         media = QVBoxLayout()
         self.view = CropView()
         media.addWidget(self.view, 1)
-        self.carousel = QScrollArea()
-        self.carousel.setWidgetResizable(True)
-        self.carousel.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
-        self.carousel.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self.carousel.setFixedHeight(112)
-        self.carousel_content = QWidget()
-        self.carousel_layout = QHBoxLayout(self.carousel_content)
-        self.carousel_layout.setContentsMargins(4, 4, 4, 4)
-        self.carousel_layout.setSpacing(6)
-        self.carousel.setWidget(self.carousel_content)
-        media.addWidget(self.carousel)
         layout.addLayout(media, 1)
 
         panel = QVBoxLayout()
@@ -321,7 +359,7 @@ class MainWindow(QMainWindow):
         video_layout = QVBoxLayout(self.video_box)
         self.video_time_label = QLabel("00:00.000 / 00:00.000")
         self.video_time_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.video_slider = QSlider(Qt.Orientation.Horizontal)
+        self.video_slider = SeekSlider(Qt.Orientation.Horizontal)
         self.video_slider.setRange(0, 10000)
         self.video_slider.setTracking(False)
         self.video_slider.sliderReleased.connect(self.seek_video_from_slider)
@@ -432,6 +470,7 @@ class MainWindow(QMainWindow):
             ),
             key=lambda path: path.name.casefold(),
         )
+        self._populate_browser()
         if not self.files:
             self.index = -1
             self.current_image = None
@@ -479,7 +518,7 @@ class MainWindow(QMainWindow):
                 self.view.set_pil_image(self.current_image)
                 self.setWindowTitle(f"Быстрая обрезка фото — {path.name}")
                 self._update_controls()
-                self._rebuild_carousel()
+                self._sync_browser()
                 return
             except Exception as error:
                 self._close_video()
@@ -490,7 +529,7 @@ class MainWindow(QMainWindow):
         self.video_box.setVisible(False)
         self.view.clear_image()
         self._update_controls()
-        self._rebuild_carousel()
+        self._sync_browser()
         if self.files and self.index >= len(self.files):
             QMessageBox.information(self, "Готово", "Все фотографии обработаны или пропущены.")
 
@@ -523,7 +562,8 @@ class MainWindow(QMainWindow):
         self.rotations[path] = (self.rotations.get(path, 0) + quarter_turns) % 4
         # The maximum centered crop is easier to position after orientation changes.
         self.view.set_pil_image(self.current_image)
-        self._rebuild_carousel()
+        self._invalidate_browser_thumbnail(self.index)
+        self._sync_browser()
 
     def _apply_saved_rotation(self, path: Path) -> None:
         turns = self.rotations.get(path, 0)
@@ -535,40 +575,63 @@ class MainWindow(QMainWindow):
             )[turns - 1]
             self.current_image = self.current_image.transpose(operation)
 
-    def _open_carousel_image(self, target_index: int) -> None:
-        self.index = target_index
+    def _populate_browser(self) -> None:
+        """Create lightweight placeholders; thumbnails are decoded only when visible."""
+        self.browser.clear()
+        for target_index, path in enumerate(self.files):
+            item = QListWidgetItem(path.name)
+            item.setData(Qt.ItemDataRole.UserRole, target_index)
+            item.setData(THUMBNAIL_LOADED_ROLE, False)
+            item.setToolTip(f"{target_index + 1} из {len(self.files)} — {path.name}")
+            item.setTextAlignment(Qt.AlignmentFlag.AlignHCenter)
+            self.browser.addItem(item)
+        self._schedule_visible_thumbnails()
+
+    def _open_browser_item(self, item: QListWidgetItem) -> None:
+        self.index = int(item.data(Qt.ItemDataRole.UserRole))
         self.load_current()
 
-    def _rebuild_carousel(self) -> None:
-        while item := self.carousel_layout.takeAt(0):
-            if item.widget():
-                item.widget().deleteLater()
-        if not self.files or self.index < 0:
+    def _schedule_visible_thumbnails(self) -> None:
+        if self._thumbnail_load_scheduled:
             return
-        first = min(max(0, self.index - 4), max(0, len(self.files) - 9))
-        last = min(len(self.files), first + 9)
-        for target_index in range(first, last):
-            path = self.files[target_index]
-            button = QToolButton()
-            button.setFixedSize(118, 92)
-            button.setIconSize(QSize(106, 76))
-            button.setToolTip(f"{target_index + 1} из {len(self.files)} — {path.name}")
+        self._thumbnail_load_scheduled = True
+        QTimer.singleShot(0, self._load_visible_thumbnails)
+
+    def _load_visible_thumbnails(self) -> None:
+        self._thumbnail_load_scheduled = False
+        visible = self.browser.viewport().rect().adjusted(0, -120, 0, 120)
+        for row in range(self.browser.count()):
+            item = self.browser.item(row)
+            if item.data(THUMBNAIL_LOADED_ROLE):
+                continue
+            if not self.browser.visualItemRect(item).intersects(visible):
+                continue
+            path = self.files[row]
             try:
-                thumb = self._load_preview(path)
-                thumb.thumbnail((106, 76), Image.Resampling.LANCZOS)
-                button.setIcon(QIcon(pil_to_pixmap(thumb)))
+                thumbnail = self._load_preview(path)
+                item.setIcon(QIcon(pil_to_pixmap(thumbnail)))
             except Exception:
-                button.setText("Ошибка")
-            border = "#2196f3" if target_index == self.index else "transparent"
-            background = "#dff5df" if path in self.collage_files else "transparent"
-            button.setStyleSheet(
-                f"QToolButton {{ border: 3px solid {border}; background: {background}; }}"
-            )
-            button.clicked.connect(
-                lambda checked=False, value=target_index: self._open_carousel_image(value)
-            )
-            self.carousel_layout.addWidget(button)
-        self.carousel_layout.addStretch()
+                item.setText(f"⚠ {path.name}")
+            item.setData(THUMBNAIL_LOADED_ROLE, True)
+
+    def _invalidate_browser_thumbnail(self, row: int) -> None:
+        if 0 <= row < self.browser.count():
+            self.browser.item(row).setData(THUMBNAIL_LOADED_ROLE, False)
+            self._schedule_visible_thumbnails()
+
+    def _sync_browser(self) -> None:
+        """Synchronize selection and collage highlighting in the file browser."""
+        if not self.files or not (0 <= self.index < self.browser.count()):
+            return
+        self.browser.setCurrentRow(self.index)
+        self.browser.scrollToItem(
+            self.browser.item(self.index), QListView.ScrollHint.EnsureVisible
+        )
+        for row in range(self.browser.count()):
+            path = self.files[row]
+            color = QColor("#dff5df") if path in self.collage_files else QColor("transparent")
+            self.browser.item(row).setBackground(QBrush(color))
+        self._schedule_visible_thumbnails()
 
     def toggle_collage_photo(self) -> None:
         if self.current_image is None:
@@ -579,12 +642,12 @@ class MainWindow(QMainWindow):
         else:
             self.collage_files.add(path)
         self._update_controls()
-        self._rebuild_carousel()
+        self._sync_browser()
 
     def clear_collage(self) -> None:
         self.collage_files.clear()
         self._update_controls()
-        self._rebuild_carousel()
+        self._sync_browser()
 
     def create_collage(self) -> None:
         if len(self.collage_files) < 2 or self.output_dir is None:
@@ -652,10 +715,10 @@ class MainWindow(QMainWindow):
         if not self.video_container.streams.video:
             raise ValueError("В файле нет видеодорожки")
         self.video_stream = self.video_container.streams.video[0]
-        if self.video_stream.duration is not None and self.video_stream.time_base is not None:
-            self.video_duration = float(self.video_stream.duration * self.video_stream.time_base)
-        elif self.video_container.duration is not None:
+        if self.video_container.duration is not None:
             self.video_duration = float(self.video_container.duration / av.time_base)
+        elif self.video_stream.duration is not None and self.video_stream.time_base is not None:
+            self.video_duration = float(self.video_stream.duration * self.video_stream.time_base)
         else:
             self.video_duration = 0.0
         if self.video_stream.average_rate:
@@ -674,11 +737,10 @@ class MainWindow(QMainWindow):
             raise ValueError("Видео не открыто")
         last_frame_time = max(0.0, self.video_duration - 1 / self.video_fps)
         seconds = max(0.0, min(seconds, last_frame_time))
-        time_base = float(self.video_stream.time_base)
         self.video_container.seek(
-            max(0, int(seconds / time_base)),
-            stream=self.video_stream,
+            max(0, int(seconds * av.time_base)),
             backward=True,
+            any_frame=False,
         )
         selected = None
         for frame in self.video_container.decode(self.video_stream):
@@ -698,8 +760,11 @@ class MainWindow(QMainWindow):
             if not container.streams.video:
                 raise ValueError(f"В {path.name} нет видеодорожки")
             stream = container.streams.video[0]
-            time_base = float(stream.time_base)
-            container.seek(max(0, int(seconds / time_base)), stream=stream, backward=True)
+            container.seek(
+                max(0, int(seconds * av.time_base)),
+                backward=True,
+                any_frame=False,
+            )
             selected = None
             for frame in container.decode(stream):
                 selected = frame
