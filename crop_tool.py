@@ -9,7 +9,7 @@ from pathlib import Path
 import av
 from PIL import Image, ImageOps
 from pillow_heif import register_heif_opener
-from PySide6.QtCore import QPointF, QRectF, QSize, Qt, QTimer, Signal
+from PySide6.QtCore import QPointF, QRectF, QSize, Qt, Signal
 from PySide6.QtGui import QAction, QBrush, QColor, QIcon, QImage, QKeySequence, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
@@ -29,6 +29,7 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QPushButton,
+    QProgressDialog,
     QRadioButton,
     QSlider,
     QSpinBox,
@@ -44,7 +45,6 @@ register_heif_opener()
 SUPPORTED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".heic", ".heif"}
 SUPPORTED_VIDEO_EXTENSIONS = {".mov", ".mp4"}
 RATIOS = (("16:10", 16 / 10), ("16:9", 16 / 9), ("4:3", 4 / 3), ("1:1", 1.0))
-THUMBNAIL_LOADED_ROLE = 257  # Qt.UserRole + 1
 
 
 def pil_to_pixmap(image: Image.Image) -> QPixmap:
@@ -272,7 +272,6 @@ class MainWindow(QMainWindow):
         self.video_duration = 0.0
         self.video_fps = 30.0
         self.current_is_video = False
-        self._thumbnail_load_scheduled = False
         self._build_ui()
         self._add_shortcuts()
         self._update_controls()
@@ -291,9 +290,6 @@ class MainWindow(QMainWindow):
         self.browser.setFixedWidth(302)
         self.browser.setToolTip("Все фото и видео из выбранной папки")
         self.browser.itemClicked.connect(self._open_browser_item)
-        self.browser.verticalScrollBar().valueChanged.connect(
-            lambda: self._schedule_visible_thumbnails()
-        )
         layout.addWidget(self.browser)
         media = QVBoxLayout()
         self.view = CropView()
@@ -562,7 +558,7 @@ class MainWindow(QMainWindow):
         self.rotations[path] = (self.rotations.get(path, 0) + quarter_turns) % 4
         # The maximum centered crop is easier to position after orientation changes.
         self.view.set_pil_image(self.current_image)
-        self._invalidate_browser_thumbnail(self.index)
+        self._set_browser_thumbnail(self.index, self.current_image)
         self._sync_browser()
 
     def _apply_saved_rotation(self, path: Path) -> None:
@@ -576,48 +572,48 @@ class MainWindow(QMainWindow):
             self.current_image = self.current_image.transpose(operation)
 
     def _populate_browser(self) -> None:
-        """Create lightweight placeholders; thumbnails are decoded only when visible."""
+        """Load every thumbnail up front so subsequent scrolling stays instant."""
         self.browser.clear()
         for target_index, path in enumerate(self.files):
             item = QListWidgetItem(path.name)
             item.setData(Qt.ItemDataRole.UserRole, target_index)
-            item.setData(THUMBNAIL_LOADED_ROLE, False)
             item.setToolTip(f"{target_index + 1} из {len(self.files)} — {path.name}")
             item.setTextAlignment(Qt.AlignmentFlag.AlignHCenter)
             self.browser.addItem(item)
-        self._schedule_visible_thumbnails()
+        if not self.files:
+            return
+        progress = QProgressDialog("Создание миниатюр…", "", 0, len(self.files), self)
+        progress.setWindowTitle("Загрузка папки")
+        progress.setCancelButton(None)
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.show()
+        self.browser.setUpdatesEnabled(False)
+        try:
+            for row, path in enumerate(self.files):
+                progress.setLabelText(
+                    f"Создание миниатюр: {row + 1} из {len(self.files)}\n{path.name}"
+                )
+                try:
+                    self._set_browser_thumbnail(row, self._load_preview(path))
+                except Exception:
+                    self.browser.item(row).setText(f"⚠ {path.name}")
+                progress.setValue(row + 1)
+                QApplication.processEvents()
+        finally:
+            self.browser.setUpdatesEnabled(True)
+            progress.close()
 
     def _open_browser_item(self, item: QListWidgetItem) -> None:
         self.index = int(item.data(Qt.ItemDataRole.UserRole))
         self.load_current()
 
-    def _schedule_visible_thumbnails(self) -> None:
-        if self._thumbnail_load_scheduled:
+    def _set_browser_thumbnail(self, row: int, image: Image.Image) -> None:
+        if not (0 <= row < self.browser.count()):
             return
-        self._thumbnail_load_scheduled = True
-        QTimer.singleShot(0, self._load_visible_thumbnails)
-
-    def _load_visible_thumbnails(self) -> None:
-        self._thumbnail_load_scheduled = False
-        visible = self.browser.viewport().rect().adjusted(0, -120, 0, 120)
-        for row in range(self.browser.count()):
-            item = self.browser.item(row)
-            if item.data(THUMBNAIL_LOADED_ROLE):
-                continue
-            if not self.browser.visualItemRect(item).intersects(visible):
-                continue
-            path = self.files[row]
-            try:
-                thumbnail = self._load_preview(path)
-                item.setIcon(QIcon(pil_to_pixmap(thumbnail)))
-            except Exception:
-                item.setText(f"⚠ {path.name}")
-            item.setData(THUMBNAIL_LOADED_ROLE, True)
-
-    def _invalidate_browser_thumbnail(self, row: int) -> None:
-        if 0 <= row < self.browser.count():
-            self.browser.item(row).setData(THUMBNAIL_LOADED_ROLE, False)
-            self._schedule_visible_thumbnails()
+        thumbnail = image.copy()
+        thumbnail.thumbnail((106, 76), Image.Resampling.LANCZOS)
+        self.browser.item(row).setIcon(QIcon(pil_to_pixmap(thumbnail)))
 
     def _sync_browser(self) -> None:
         """Synchronize selection and collage highlighting in the file browser."""
@@ -631,7 +627,6 @@ class MainWindow(QMainWindow):
             path = self.files[row]
             color = QColor("#dff5df") if path in self.collage_files else QColor("transparent")
             self.browser.item(row).setBackground(QBrush(color))
-        self._schedule_visible_thumbnails()
 
     def toggle_collage_photo(self) -> None:
         if self.current_image is None:
@@ -698,7 +693,17 @@ class MainWindow(QMainWindow):
             image = self._read_video_frame(path, self.video_positions.get(path, 0.0))
         else:
             with Image.open(path) as opened:
-                image = ImageOps.exif_transpose(opened).copy()
+                image = ImageOps.exif_transpose(opened)
+                turns = self.rotations.get(path, 0)
+                if turns:
+                    operation = (
+                        Image.Transpose.ROTATE_270,
+                        Image.Transpose.ROTATE_180,
+                        Image.Transpose.ROTATE_90,
+                    )[turns - 1]
+                    image = image.transpose(operation)
+                image.thumbnail((106, 76), Image.Resampling.LANCZOS)
+                return image.copy()
         turns = self.rotations.get(path, 0)
         if turns:
             operation = (
@@ -792,6 +797,7 @@ class MainWindow(QMainWindow):
             self.current_image = self._decode_video_frame(seconds)
             self._apply_saved_rotation(self.files[self.index])
             self.view.set_pil_image(self.current_image)
+            self._set_browser_thumbnail(self.index, self.current_image)
             actual = self.video_positions.get(self.files[self.index], seconds)
             self._set_video_slider(actual)
         except Exception as error:
