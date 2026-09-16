@@ -13,7 +13,7 @@
 ```powershell
 py -m venv .venv
 .\.venv\Scripts\python.exe -m pip install --upgrade pip
-.\.venv\Scripts\python.exe -m pip install pyside6 pillow pillow-heif pyinstaller
+.\.venv\Scripts\python.exe -m pip install pyside6 pillow pillow-heif av pyinstaller
 .\.venv\Scripts\python.exe crop_tool.py
 ```
 
@@ -58,6 +58,22 @@ py -m venv .venv
 Иначе размер холста выбирается по самому крупному исходнику. Существующие файлы
 не перезаписываются: к имени автоматически добавляется индекс.
 
+### Извлечение кадров из видео
+
+В папке с исходниками приложение также находит файлы `.mov` и `.mp4`. При
+открытии видео появляется временная шкала и кнопки **«← Кадр»** / **«Кадр →»**:
+
+1. Перетащите ползунок примерно к нужному месту ролика.
+2. Кнопками покадрового перехода выберите точный кадр.
+3. При необходимости поверните изображение и настройте рамку обрезки.
+4. Нажмите **«Сохранить кадр»**, `Enter` или `Пробел`.
+
+Кадр сохраняется как JPG или PNG с текущими настройками качества и рамки, а
+видео остаётся открытым для извлечения следующего кадра. В имя добавляется время
+кадра в миллисекундах, например `clip_000012340ms_16x9.jpg`. Кадры видео также
+можно добавлять в коллаж; для каждого видео используется последняя выбранная
+позиция.
+
 Имена создаются автоматически (`IMG_1234_16x9.jpg`). Если имя занято,
 приложение добавит `_2`, `_3` и т. д. Изображение не масштабируется, пока не
 включена опция ограничения длинной стороны. Для JPG доступно качество 1–100
@@ -70,21 +86,22 @@ py -m venv .venv
 активировать не нужно:
 
 ```powershell
-.\.venv\Scripts\python.exe -m PyInstaller --noconfirm --clean --onefile --windowed --name PhotoCropper --collect-all PySide6 --collect-all PIL --collect-all pillow_heif crop_tool.py
+.\.venv\Scripts\python.exe -m PyInstaller --noconfirm --clean --onefile --windowed --name PhotoCropper --collect-all PySide6 --collect-all PIL --collect-all pillow_heif --collect-all av crop_tool.py
 ```
 
 Готовый файл находится в `dist\PhotoCropper.exe`. Флаг `--windowed` убирает
 консоль, `--onefile` упаковывает приложение в один файл, а `--collect-all`
 явно включает плагины Qt (в частности, платформенный плагин Windows), модули
-Pillow и нативный HEIF/HEIC-декодер из `pillow-heif`. Первый запуск
-onefile-сборки может быть чуть медленнее: файлы временно распаковываются системой.
+Pillow, нативный HEIF/HEIC-декодер из `pillow-heif` и видеодекодеры PyAV. Первый
+запуск onefile-сборки может быть чуть медленнее: файлы временно распаковываются
+системой.
 
 Если установлен старый PyInstaller или возникает ошибка о Qt platform plugin,
 обновите инструменты и пересоберите проект с очисткой:
 
 ```powershell
-.\.venv\Scripts\python.exe -m pip install --upgrade pyside6 pillow pillow-heif pyinstaller
-.\.venv\Scripts\python.exe -m PyInstaller --noconfirm --clean --onefile --windowed --name PhotoCropper --collect-all PySide6 --collect-all PIL --collect-all pillow_heif crop_tool.py
+.\.venv\Scripts\python.exe -m pip install --upgrade pyside6 pillow pillow-heif av pyinstaller
+.\.venv\Scripts\python.exe -m PyInstaller --noconfirm --clean --onefile --windowed --name PhotoCropper --collect-all PySide6 --collect-all PIL --collect-all pillow_heif --collect-all av crop_tool.py
 ```
 
 Не используйте одновременно PyQt и PySide в том же виртуальном окружении:
@@ -101,9 +118,11 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 
 ## Ошибки и форматы
 
-Поддерживаются `.jpg`, `.jpeg`, `.png`, `.webp`, `.heic` и `.heif`. Файлы HEIC
+Поддерживаются изображения `.jpg`, `.jpeg`, `.png`, `.webp`, `.heic`, `.heif` и
+видео `.mov`, `.mp4`. Файлы HEIC
 открываются через `pillow-heif`; результат, как и для остальных исходников,
 сохраняется в выбранный JPG или PNG. Битые файлы показываются в предупреждении и
 пропускаются. При невозможности создать папку или записать файл приложение
 показывает ошибку и остаётся на текущей фотографии, поэтому рамку не нужно
-выставлять заново.
+выставлять заново. Видео декодируется библиотекой PyAV, которая устанавливается
+вместе с собственными FFmpeg-библиотеками; отдельная установка FFmpeg не нужна.

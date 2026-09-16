@@ -6,6 +6,7 @@ import math
 import sys
 from pathlib import Path
 
+import av
 from PIL import Image, ImageOps
 from pillow_heif import register_heif_opener
 from PySide6.QtCore import QPointF, QRectF, QSize, Qt, Signal
@@ -40,6 +41,7 @@ from PySide6.QtWidgets import (
 register_heif_opener()
 
 SUPPORTED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".heic", ".heif"}
+SUPPORTED_VIDEO_EXTENSIONS = {".mov", ".mp4"}
 RATIOS = (("16:10", 16 / 10), ("16:9", 16 / 9), ("4:3", 4 / 3), ("1:1", 1.0))
 
 
@@ -230,6 +232,12 @@ class MainWindow(QMainWindow):
         self.current_image: Image.Image | None = None
         self.collage_files: set[Path] = set()
         self.rotations: dict[Path, int] = {}
+        self.video_positions: dict[Path, float] = {}
+        self.video_container = None
+        self.video_stream = None
+        self.video_duration = 0.0
+        self.video_fps = 30.0
+        self.current_is_video = False
         self._build_ui()
         self._add_shortcuts()
         self._update_controls()
@@ -309,6 +317,28 @@ class MainWindow(QMainWindow):
         form.addRow("Максимум:", self.max_size)
         panel.addWidget(settings)
 
+        self.video_box = QGroupBox("Кадр из видео")
+        video_layout = QVBoxLayout(self.video_box)
+        self.video_time_label = QLabel("00:00.000 / 00:00.000")
+        self.video_time_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.video_slider = QSlider(Qt.Orientation.Horizontal)
+        self.video_slider.setRange(0, 10000)
+        self.video_slider.setTracking(False)
+        self.video_slider.sliderReleased.connect(self.seek_video_from_slider)
+        self.video_slider.valueChanged.connect(self._update_video_time_preview)
+        frame_buttons = QHBoxLayout()
+        self.previous_frame_button = QPushButton("← Кадр")
+        self.next_frame_button = QPushButton("Кадр →")
+        self.previous_frame_button.clicked.connect(lambda: self.step_video_frame(-1))
+        self.next_frame_button.clicked.connect(lambda: self.step_video_frame(1))
+        frame_buttons.addWidget(self.previous_frame_button)
+        frame_buttons.addWidget(self.next_frame_button)
+        video_layout.addWidget(self.video_time_label)
+        video_layout.addWidget(self.video_slider)
+        video_layout.addLayout(frame_buttons)
+        self.video_box.setVisible(False)
+        panel.addWidget(self.video_box)
+
         rotate = QHBoxLayout()
         self.rotate_left_button = QPushButton("↶ 90° влево")
         self.rotate_right_button = QPushButton("90° вправо ↷")
@@ -357,7 +387,7 @@ class MainWindow(QMainWindow):
             "← / → — назад / пропустить\n"
             "Ctrl+← / Ctrl+→ — повернуть на 90°\n"
             "1–4 — выбрать формат рамки\n"
-            "Клик по миниатюре — открыть фото"
+            "Клик по миниатюре — открыть файл"
         )
         hints.setStyleSheet("color: #777")
         panel.addWidget(hints)
@@ -388,21 +418,30 @@ class MainWindow(QMainWindow):
         selected = QFileDialog.getExistingDirectory(self, "Выберите папку с фотографиями")
         if not selected:
             return
+        self._close_video()
         self.source_dir = Path(selected)
         self.collage_files.clear()
         self.rotations.clear()
+        self.video_positions.clear()
         self.files = sorted(
-            (path for path in self.source_dir.iterdir() if path.is_file() and path.suffix.lower() in SUPPORTED_EXTENSIONS),
+            (
+                path
+                for path in self.source_dir.iterdir()
+                if path.is_file()
+                and path.suffix.lower() in SUPPORTED_EXTENSIONS | SUPPORTED_VIDEO_EXTENSIONS
+            ),
             key=lambda path: path.name.casefold(),
         )
         if not self.files:
             self.index = -1
             self.current_image = None
+            self.current_is_video = False
+            self.video_box.setVisible(False)
             self.view.clear_image()
             QMessageBox.information(
                 self,
                 "Нет фотографий",
-                "В выбранной папке нет JPG, PNG, WebP, HEIC или HEIF файлов.",
+                "В выбранной папке нет JPG, PNG, WebP, HEIC, HEIF, MOV или MP4 файлов.",
             )
         else:
             self.output_dir = self.source_dir / "cropped"
@@ -419,12 +458,23 @@ class MainWindow(QMainWindow):
             self.output_label.setText(f"Назначение: {self.output_dir}")
 
     def load_current(self) -> None:
+        self._close_video()
         while 0 <= self.index < len(self.files):
             path = self.files[self.index]
             try:
-                with Image.open(path) as opened:
-                    opened.load()
-                    self.current_image = ImageOps.exif_transpose(opened).copy()
+                if path.suffix.lower() in SUPPORTED_VIDEO_EXTENSIONS:
+                    self._open_video(path)
+                    position = self.video_positions.get(path, 0.0)
+                    self.current_image = self._decode_video_frame(position)
+                    self.current_is_video = True
+                    self.video_box.setVisible(True)
+                    self._set_video_slider(position)
+                else:
+                    with Image.open(path) as opened:
+                        opened.load()
+                        self.current_image = ImageOps.exif_transpose(opened).copy()
+                    self.current_is_video = False
+                    self.video_box.setVisible(False)
                 self._apply_saved_rotation(path)
                 self.view.set_pil_image(self.current_image)
                 self.setWindowTitle(f"Быстрая обрезка фото — {path.name}")
@@ -432,9 +482,12 @@ class MainWindow(QMainWindow):
                 self._rebuild_carousel()
                 return
             except Exception as error:
+                self._close_video()
                 QMessageBox.warning(self, "Не удалось открыть", f"{path.name}\n\n{error}\n\nФайл будет пропущен.")
                 self.index += 1
         self.current_image = None
+        self.current_is_video = False
+        self.video_box.setVisible(False)
         self.view.clear_image()
         self._update_controls()
         self._rebuild_carousel()
@@ -501,18 +554,8 @@ class MainWindow(QMainWindow):
             button.setIconSize(QSize(106, 76))
             button.setToolTip(f"{target_index + 1} из {len(self.files)} — {path.name}")
             try:
-                with Image.open(path) as opened:
-                    thumb = ImageOps.exif_transpose(opened)
-                    turns = self.rotations.get(path, 0)
-                    if turns:
-                        operation = (
-                            Image.Transpose.ROTATE_270,
-                            Image.Transpose.ROTATE_180,
-                            Image.Transpose.ROTATE_90,
-                        )[turns - 1]
-                        thumb = thumb.transpose(operation)
-                    thumb.thumbnail((106, 76), Image.Resampling.LANCZOS)
-                    thumb = thumb.copy()
+                thumb = self._load_preview(path)
+                thumb.thumbnail((106, 76), Image.Resampling.LANCZOS)
                 button.setIcon(QIcon(pil_to_pixmap(thumb)))
             except Exception:
                 button.setText("Ошибка")
@@ -570,9 +613,12 @@ class MainWindow(QMainWindow):
         QMessageBox.information(self, "Коллаж сохранён", str(output_path))
 
     def _load_for_collage(self, path: Path) -> Image.Image:
-        with Image.open(path) as opened:
-            opened.load()
-            image = ImageOps.exif_transpose(opened).convert("RGB")
+        if path.suffix.lower() in SUPPORTED_VIDEO_EXTENSIONS:
+            image = self._read_video_frame(path, self.video_positions.get(path, 0.0))
+        else:
+            with Image.open(path) as opened:
+                opened.load()
+                image = ImageOps.exif_transpose(opened).convert("RGB")
         turns = self.rotations.get(path, 0)
         if turns:
             operation = (
@@ -582,6 +628,131 @@ class MainWindow(QMainWindow):
             )[turns - 1]
             image = image.transpose(operation)
         return image
+
+    def _load_preview(self, path: Path) -> Image.Image:
+        """Load a photo or the remembered frame of a video for a thumbnail."""
+        if path.suffix.lower() in SUPPORTED_VIDEO_EXTENSIONS:
+            image = self._read_video_frame(path, self.video_positions.get(path, 0.0))
+        else:
+            with Image.open(path) as opened:
+                image = ImageOps.exif_transpose(opened).copy()
+        turns = self.rotations.get(path, 0)
+        if turns:
+            operation = (
+                Image.Transpose.ROTATE_270,
+                Image.Transpose.ROTATE_180,
+                Image.Transpose.ROTATE_90,
+            )[turns - 1]
+            image = image.transpose(operation)
+        image.thumbnail((106, 76), Image.Resampling.LANCZOS)
+        return image
+
+    def _open_video(self, path: Path) -> None:
+        self.video_container = av.open(str(path))
+        if not self.video_container.streams.video:
+            raise ValueError("В файле нет видеодорожки")
+        self.video_stream = self.video_container.streams.video[0]
+        if self.video_stream.duration is not None and self.video_stream.time_base is not None:
+            self.video_duration = float(self.video_stream.duration * self.video_stream.time_base)
+        elif self.video_container.duration is not None:
+            self.video_duration = float(self.video_container.duration / av.time_base)
+        else:
+            self.video_duration = 0.0
+        if self.video_stream.average_rate:
+            self.video_fps = max(1.0, float(self.video_stream.average_rate))
+        else:
+            self.video_fps = 30.0
+
+    def _close_video(self) -> None:
+        if self.video_container is not None:
+            self.video_container.close()
+        self.video_container = None
+        self.video_stream = None
+
+    def _decode_video_frame(self, seconds: float) -> Image.Image:
+        if self.video_container is None or self.video_stream is None:
+            raise ValueError("Видео не открыто")
+        last_frame_time = max(0.0, self.video_duration - 1 / self.video_fps)
+        seconds = max(0.0, min(seconds, last_frame_time))
+        time_base = float(self.video_stream.time_base)
+        self.video_container.seek(
+            max(0, int(seconds / time_base)),
+            stream=self.video_stream,
+            backward=True,
+        )
+        selected = None
+        for frame in self.video_container.decode(self.video_stream):
+            selected = frame
+            if frame.time is None or float(frame.time) >= seconds:
+                break
+        if selected is None:
+            raise ValueError("Не удалось декодировать кадр видео")
+        actual_time = float(selected.time) if selected.time is not None else seconds
+        path = self.files[self.index]
+        self.video_positions[path] = actual_time
+        return selected.to_image().convert("RGB")
+
+    @staticmethod
+    def _read_video_frame(path: Path, seconds: float) -> Image.Image:
+        with av.open(str(path)) as container:
+            if not container.streams.video:
+                raise ValueError(f"В {path.name} нет видеодорожки")
+            stream = container.streams.video[0]
+            time_base = float(stream.time_base)
+            container.seek(max(0, int(seconds / time_base)), stream=stream, backward=True)
+            selected = None
+            for frame in container.decode(stream):
+                selected = frame
+                if frame.time is None or float(frame.time) >= seconds:
+                    break
+            if selected is None:
+                raise ValueError(f"Не удалось прочитать кадр из {path.name}")
+            return selected.to_image().convert("RGB")
+
+    def seek_video_from_slider(self) -> None:
+        if not self.current_is_video:
+            return
+        seconds = self.video_duration * self.video_slider.value() / 10000
+        self._show_video_frame(seconds)
+
+    def step_video_frame(self, direction: int) -> None:
+        if not self.current_is_video:
+            return
+        path = self.files[self.index]
+        seconds = self.video_positions.get(path, 0.0) + direction / self.video_fps
+        self._show_video_frame(seconds)
+
+    def _show_video_frame(self, seconds: float) -> None:
+        try:
+            self.current_image = self._decode_video_frame(seconds)
+            self._apply_saved_rotation(self.files[self.index])
+            self.view.set_pil_image(self.current_image)
+            actual = self.video_positions.get(self.files[self.index], seconds)
+            self._set_video_slider(actual)
+        except Exception as error:
+            QMessageBox.warning(self, "Видео", f"Не удалось открыть кадр:\n{error}")
+
+    def _set_video_slider(self, seconds: float) -> None:
+        value = round(10000 * seconds / self.video_duration) if self.video_duration else 0
+        self.video_slider.blockSignals(True)
+        self.video_slider.setValue(max(0, min(10000, value)))
+        self.video_slider.blockSignals(False)
+        self.video_time_label.setText(
+            f"{self._format_video_time(seconds)} / {self._format_video_time(self.video_duration)}"
+        )
+
+    def _update_video_time_preview(self, value: int) -> None:
+        seconds = self.video_duration * value / 10000
+        self.video_time_label.setText(
+            f"{self._format_video_time(seconds)} / {self._format_video_time(self.video_duration)}"
+        )
+
+    @staticmethod
+    def _format_video_time(seconds: float) -> str:
+        milliseconds = max(0, round(seconds * 1000))
+        minutes, remainder = divmod(milliseconds, 60_000)
+        whole_seconds, milliseconds = divmod(remainder, 1000)
+        return f"{minutes:02d}:{whole_seconds:02d}.{milliseconds:03d}"
 
     def _compose_collage(self, images: list[Image.Image]) -> Image.Image:
         """Place center-cropped photos in an automatic white grid."""
@@ -644,6 +815,9 @@ class MainWindow(QMainWindow):
         except Exception as error:
             QMessageBox.critical(self, "Ошибка сохранения", f"Не удалось сохранить файл:\n{error}")
             return
+        if self.current_is_video:
+            self.statusBar().showMessage(f"Кадр сохранён: {output_path}", 5000)
+            return
         self.index += 1
         self.load_current()
 
@@ -666,7 +840,12 @@ class MainWindow(QMainWindow):
     def _unique_output_path(self) -> Path:
         suffix = str(self.ratio_group.checkedButton().property("suffix"))
         extension = ".jpg" if self.format_combo.currentText() == "JPG" else ".png"
-        base = f"{self.files[self.index].stem}_{suffix}"
+        source = self.files[self.index]
+        if self.current_is_video:
+            milliseconds = round(self.video_positions.get(source, 0.0) * 1000)
+            base = f"{source.stem}_{milliseconds:09d}ms_{suffix}"
+        else:
+            base = f"{source.stem}_{suffix}"
         return self._unique_named_path(base, extension)
 
     def _unique_named_path(self, base: str, extension: str) -> Path:
@@ -683,6 +862,9 @@ class MainWindow(QMainWindow):
         self.counter.setText(f"Фото {shown} из {total}")
         active = self.current_image is not None
         self.crop_button.setEnabled(active)
+        self.crop_button.setText(
+            "Сохранить кадр" if self.current_is_video else "Обрезать и следующее"
+        )
         self.skip_button.setEnabled(active)
         self.back_button.setEnabled(active and self.index > 0)
         self.rotate_left_button.setEnabled(active)
@@ -696,6 +878,10 @@ class MainWindow(QMainWindow):
         self.collage_toggle_button.setEnabled(active)
         self.collage_create_button.setEnabled(selected >= 2 and self.output_dir is not None)
         self.collage_clear_button.setEnabled(selected > 0)
+
+    def closeEvent(self, event) -> None:  # noqa: N802 (Qt API)
+        self._close_video()
+        super().closeEvent(event)
 
 
 def main() -> int:
